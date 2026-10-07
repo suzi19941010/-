@@ -33,14 +33,43 @@ const DEFAULT_WAITLIST = 2;
 if (!process.env.SESSION_SECRET && !DEV_MODE) console.warn('SESSION_SECRET이 없어 임시 값을 씁니다. (재시작하면 다시 로그인 필요)');
 if (!KAKAO_REST_KEY && !DEV_MODE) console.warn('KAKAO_REST_API_KEY가 없어 로그인이 동작하지 않습니다.');
 
-// ---------- 저장소 (JSON 파일) ----------
+// ---------- 저장소 ----------
+// UPSTASH_REDIS_REST_URL/TOKEN이 있으면 Upstash(무료 Redis)에, 없으면 로컬 data.json에 저장.
+// 데이터 전체를 메모리에 들고 있고, 바뀔 때마다 통째로 저장한다 (서버는 1대만 띄울 것).
+const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_KEY = process.env.REDIS_KEY || 'kakao-poll:db';
+const useRedis = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
+
+async function redis(cmd) {
+  const r = await fetch(UPSTASH_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN }, body: JSON.stringify(cmd) });
+  const j = await r.json();
+  if (j.error) throw new Error('Upstash: ' + j.error);
+  return j.result;
+}
+
 let db = { polls: {}, series: {} };
-if (fs.existsSync(DATA_FILE)) db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8').replace(/^﻿/, ''));
-db.series ||= {};
+async function load() {
+  let raw = null;
+  if (useRedis) raw = await redis(['GET', REDIS_KEY]);
+  else if (fs.existsSync(DATA_FILE)) raw = fs.readFileSync(DATA_FILE, 'utf8').replace(/^﻿/, '');
+  if (raw) db = JSON.parse(raw);
+  db.polls ||= {};
+  db.series ||= {};
+}
+
+// 저장 요청을 순서대로 처리. 실패하면 다음 저장 때 다시 통째로 써지므로 데이터가 꼬이지 않음
+let saving = Promise.resolve();
 function save() {
-  const tmp = DATA_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-  fs.renameSync(tmp, DATA_FILE);
+  const snapshot = JSON.stringify(db);
+  saving = saving.then(async () => {
+    if (useRedis) await redis(['SET', REDIS_KEY, snapshot]);
+    else {
+      fs.writeFileSync(DATA_FILE + '.tmp', snapshot);
+      fs.renameSync(DATA_FILE + '.tmp', DATA_FILE);
+    }
+  }).catch((e) => console.error('저장 실패:', e.message));
+  return saving;
 }
 
 // ---------- 유틸 ----------
@@ -127,6 +156,10 @@ function ensureRound(s) {
   };
   db.polls[poll.id] = poll;
   s.currentPollId = poll.id;
+  // 저장 용량 관리: 8주 넘게 지난 회차는 정리
+  for (const old of Object.values(db.polls)) {
+    if (old.seriesId === s.id && old.eventAt < now - 8 * WEEK) delete db.polls[old.id];
+  }
   save();
   return poll;
 }
@@ -421,7 +454,7 @@ async function handle(req, res) {
     }
     const poll = { id: newId(), ...pollFields(b), ownerId: user.uid, ownerName: user.name, createdAt: Date.now(), closed: false, entries: [] };
     db.polls[poll.id] = poll;
-    save();
+    await save();
     return redirect(res, `/p/${poll.id}`);
   }
 
@@ -445,13 +478,13 @@ ${user && user.uid === s.ownerId ? `<form method="post" action="/s/${s.id}/toggl
       Object.assign(s, seriesFields(b));
       const cur = db.polls[s.currentPollId];
       if (cur && cur.entries.length === 0) { delete db.polls[cur.id]; s.currentPollId = null; } // 신청자 없으면 바로 새 설정으로
-      save();
+      await save();
       ensureRound(s);
       return redirect(res, `/s/${s.id}?m=seriessaved`);
     }
     if (action === 'toggle') {
       s.active = !s.active;
-      save();
+      await save();
       ensureRound(s);
       return redirect(res, `/s/${s.id}?m=${s.active ? 'resumed' : 'stopped'}`);
     }
@@ -479,13 +512,13 @@ ${user && user.uid === s.ownerId ? `<form method="post" action="/s/${s.id}/toggl
       if (poll.eventAt && Date.now() >= poll.eventAt) return back('ended');
       if (poll.closed) return back('closed');
       if (poll.entries.length >= poll.capacity + poll.waitlist) return back('full');
-      poll.entries.push({ uid: user.uid, name: user.name, at: Date.now() });
-      save();
-      return back(poll.entries.length <= poll.capacity ? 'joined' : 'waiting');
+      const position = poll.entries.push({ uid: user.uid, name: user.name, at: Date.now() }); // 저장 기다리기 전에 순번 확정
+      await save();
+      return back(position <= poll.capacity ? 'joined' : 'waiting');
     }
     if (action === 'leave') {
       poll.entries = poll.entries.filter((e) => e.uid !== user.uid);
-      save();
+      await save();
       return back('left');
     }
 
@@ -495,14 +528,14 @@ ${user && user.uid === s.ownerId ? `<form method="post" action="/s/${s.id}/toggl
       if (series) { delete f.day; delete f.time; } // 반복 회차의 날짜는 반복 설정에서만 바꿈
       if (f.capacity + f.waitlist < poll.entries.length) return back('toosmall');
       Object.assign(poll, f);
-      save();
+      await save();
       return back('saved');
     }
-    if (action === 'close') { poll.closed = !poll.closed; save(); return back(); }
-    if (action === 'kick') { poll.entries = poll.entries.filter((e) => e.uid !== b.uid); save(); return back('kicked'); }
+    if (action === 'close') { poll.closed = !poll.closed; await save(); return back(); }
+    if (action === 'kick') { poll.entries = poll.entries.filter((e) => e.uid !== b.uid); await save(); return back('kicked'); }
     if (action === 'delete') {
       delete db.polls[poll.id];
-      save();
+      await save();
       return redirect(res, series ? `/s/${series.id}` : '/');
     }
   }
@@ -511,10 +544,12 @@ ${user && user.uid === s.ownerId ? `<form method="post" action="/s/${s.id}/toggl
 }
 
 // 서버가 깨어 있는 동안 1분마다 다음 회차 생성 (잠들어 있어도 링크를 열면 그때 생성됨)
-setInterval(() => Object.values(db.series).forEach(ensureRound), 60e3);
-
-http.createServer((req, res) => {
-  handle(req, res).catch((e) => { console.error(e); if (!res.headersSent) send(res, 500, '서버 오류'); });
-}).listen(PORT, () => {
-  console.log(`실행 중: ${BASE_URL}  (Kakao Redirect URI: ${REDIRECT_URI})${DEV_MODE && !KAKAO_REST_KEY ? '  [DEV_MODE 테스트 로그인]' : ''}`);
-});
+load().then(() => {
+  setInterval(() => Object.values(db.series).forEach(ensureRound), 60e3);
+  http.createServer((req, res) => {
+    handle(req, res).catch((e) => { console.error(e); if (!res.headersSent) send(res, 500, '서버 오류'); });
+  }).listen(PORT, () => {
+    console.log(`실행 중: ${BASE_URL}  (Kakao Redirect URI: ${REDIRECT_URI})${DEV_MODE && !KAKAO_REST_KEY ? '  [DEV_MODE 테스트 로그인]' : ''}`);
+    console.log(useRedis ? '저장소: Upstash Redis' : `저장소: ${DATA_FILE}${process.env.RENDER ? '  ⚠️ Render 무료 서버에서는 잠들면 지워집니다. UPSTASH 설정 필요' : ''}`);
+  });
+}).catch((e) => { console.error('데이터 불러오기 실패:', e.message); process.exit(1); });
