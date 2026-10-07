@@ -1,0 +1,13 @@
+{
+  "name": "kakao-signup-poll",
+  "version": "1.0.0",
+  "private": true,
+  "description": "카카오 로그인 선착순 참가 투표",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
