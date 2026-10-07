@@ -34,8 +34,9 @@ if (!process.env.SESSION_SECRET && !DEV_MODE) console.warn('SESSION_SECRET이 �
 if (!KAKAO_REST_KEY && !DEV_MODE) console.warn('KAKAO_REST_API_KEY가 없어 로그인이 동작하지 않습니다.');
 
 // ---------- 저장소 (JSON 파일) ----------
-let db = { polls: {} };
-if (fs.existsSync(DATA_FILE)) db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+let db = { polls: {}, series: {} };
+if (fs.existsSync(DATA_FILE)) db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8').replace(/^﻿/, ''));
+db.series ||= {};
 function save() {
   const tmp = DATA_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
@@ -83,6 +84,53 @@ const safeNext = (n) => (typeof n === 'string' && n.startsWith('/') && !n.starts
 const newId = () => crypto.randomBytes(6).toString('base64url');
 const clampInt = (v, min, max, def) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 
+// ---------- 시간 (한국 시간 기준 — 서버가 UTC여도 동작) ----------
+const KST = 9 * 3600e3;
+const WEEK = 7 * 86400e3;
+const ROLLOVER_MS = 3 * 3600e3; // 모임 시작 3시간 뒤 다음 회차로 넘어감
+const kst = (ms) => new Date(ms + KST); // getUTC*로 읽으면 한국 시각
+const dayIdx = (jsDay) => (jsDay + 6) % 7; // JS 일=0 → 월=0
+function kstMs(y, mo, d, hhmm) {
+  const [h, mi] = hhmm.split(':').map(Number);
+  return Date.UTC(y, mo, d, h, mi) - KST;
+}
+// after 이후 가장 가까운 day요일 time
+function nextEventAt(after, day, time) {
+  const k = kst(after);
+  const delta = (DAYS.indexOf(day) - dayIdx(k.getUTCDay()) + 7) % 7;
+  const ms = kstMs(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate() + delta, time);
+  return ms <= after ? ms + WEEK : ms;
+}
+// 모임 시각 이전의 가장 가까운 openDay요일 openTime
+function openAtFor(eventAt, day, openDay, openTime) {
+  const k = kst(eventAt);
+  const back = (DAYS.indexOf(day) - DAYS.indexOf(openDay) + 7) % 7;
+  const ms = kstMs(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate() - back, openTime);
+  return ms >= eventAt ? ms - WEEK : ms;
+}
+function fmtKst(ms) {
+  const k = kst(ms);
+  const hm = `${String(k.getUTCHours()).padStart(2, '0')}:${String(k.getUTCMinutes()).padStart(2, '0')}`;
+  return `${k.getUTCMonth() + 1}/${k.getUTCDate()}(${DAYS[dayIdx(k.getUTCDay())][0]}) ${hm}`;
+}
+
+// 반복 투표: 현재 회차가 끝났으면 다음 주 회차를 만든다
+function ensureRound(s) {
+  const cur = db.polls[s.currentPollId];
+  const now = Date.now();
+  if (!s.active || (cur && now < cur.eventAt + ROLLOVER_MS)) return cur;
+  const eventAt = nextEventAt(now, s.day, s.time);
+  const poll = {
+    id: newId(), seriesId: s.id, title: s.title, day: s.day, time: s.time, capacity: s.capacity, waitlist: s.waitlist, note: s.note,
+    ownerId: s.ownerId, ownerName: s.ownerName, createdAt: now, closed: false, entries: [],
+    eventAt, opensAt: openAtFor(eventAt, s.day, s.openDay, s.openTime),
+  };
+  db.polls[poll.id] = poll;
+  s.currentPollId = poll.id;
+  save();
+  return poll;
+}
+
 const MESSAGES = {
   joined: '참가 완료! 확정 명단에 들어갔어요.',
   waiting: '정원이 차서 대기 명단에 들어갔어요. 취소자가 생기면 자동으로 확정돼요.',
@@ -94,6 +142,11 @@ const MESSAGES = {
   toosmall: '현재 신청자 수보다 정원+대기를 작게 줄일 수 없어요.',
   kicked: '해당 참가자를 명단에서 뺐어요.',
   loginfail: '카카오 로그인에 실패했어요. 다시 시도해 주세요.',
+  notopen: '아직 투표가 열리지 않았어요.',
+  ended: '이미 지난 회차예요.',
+  seriessaved: '반복 설정을 저장했어요. 다음 회차부터 적용돼요. (아직 신청자가 없는 회차는 바로 적용)',
+  stopped: '매주 반복을 멈췄어요.',
+  resumed: '매주 반복을 다시 시작했어요.',
 };
 
 // ---------- 화면 ----------
@@ -138,16 +191,25 @@ function loginButton(next) {
   return `<a class="btn kakao" href="/login?next=${encodeURIComponent(next)}">카카오로 로그인</a>`;
 }
 
+const dayOptions = (sel) => DAYS.map((d) => `<option${d === sel ? ' selected' : ''}>${d}</option>`).join('');
+function openFields(openDay, openTime) {
+  return `<div class="row"><div><label>신청 열리는 요일</label><select name="openDay">${dayOptions(openDay)}</select></div>
+<div><label>신청 열리는 시간</label><input type="time" name="openTime" value="${esc(openTime)}"></div></div>`;
+}
+
 function homePage(user, msg) {
   if (!user) {
     return layout('선착순 투표', `<div class="card"><h1>선착순 참가 투표</h1>
 <p class="muted">요일·시간·인원을 정해 투표를 만들고, 링크를 카카오톡 방에 공유하세요. 카카오 계정당 1명만 신청할 수 있어요.</p>
 ${loginButton('/')}</div>`);
   }
-  const mine = Object.values(db.polls).filter((p) => p.ownerId === user.uid).sort((a, b) => b.createdAt - a.createdAt);
-  const list = mine.length
-    ? `<ul style="padding:0;margin:0;list-style:none">${mine.map((p) => `<li><a href="/p/${p.id}">${esc(p.title)}</a><span class="muted">${esc(p.day)} ${esc(p.time)} · ${Math.min(p.entries.length, p.capacity)}/${p.capacity}</span></li>`).join('')}</ul>`
-    : '<p class="muted">아직 만든 투표가 없어요.</p>';
+  const mySeries = Object.values(db.series).filter((s) => s.ownerId === user.uid).sort((a, b) => b.createdAt - a.createdAt);
+  const mine = Object.values(db.polls).filter((p) => p.ownerId === user.uid && !p.seriesId).sort((a, b) => b.createdAt - a.createdAt);
+  const items = [
+    ...mySeries.map((s) => `<li><a href="/s/${s.id}">${esc(s.title)}</a><span class="muted">매주 ${esc(s.day)} ${esc(s.time)} · ${s.active ? '<span class="ok">반복 중</span>' : '중지됨'}</span></li>`),
+    ...mine.map((p) => `<li><a href="/p/${p.id}">${esc(p.title)}</a><span class="muted">${esc(p.day)} ${esc(p.time)} · ${Math.min(p.entries.length, p.capacity)}/${p.capacity}</span></li>`),
+  ];
+  const list = items.length ? `<ul style="padding:0;margin:0;list-style:none">${items.join('')}</ul>` : '<p class="muted">아직 만든 투표가 없어요.</p>';
   return layout('선착순 투표', `${msg ? `<div class="msg">${esc(msg)}</div>` : ''}
 <form class="card" method="post" action="/polls"><h2>새 투표 만들기</h2>
 <label>제목</label><input name="title" maxlength="60" required placeholder="예: 목요일 저녁 풋살">
@@ -156,6 +218,9 @@ ${loginButton('/')}</div>`);
 <div class="row"><div><label>인원 (선착순)</label><input type="number" name="capacity" min="1" max="100" value="${DEFAULT_CAPACITY}" required></div>
 <div><label>대기 인원</label><input type="number" name="waitlist" min="0" max="50" value="${DEFAULT_WAITLIST}" required></div></div>
 <label>메모 (선택)</label><input name="note" maxlength="120" placeholder="장소, 회비 등">
+<label style="display:flex;gap:8px;align-items:center;color:var(--text);margin-top:14px"><input type="checkbox" name="repeat" style="width:auto" onchange="document.getElementById('rp').hidden=!this.checked"> 매주 반복</label>
+<div id="rp" hidden><p class="muted" style="margin:4px 0 0">매주 새 회차가 자동으로 만들어지고, 아래 시각에 신청이 열려요. 공유 링크는 계속 같아요.</p>
+${openFields('월요일', '12:00')}</div>
 <button>투표 만들기</button></form>
 <div class="card"><h2>내가 만든 투표</h2>${list}</div>`, { user });
 }
@@ -167,7 +232,14 @@ function pollPage(poll, user, msg) {
   const isOwner = user && user.uid === poll.ownerId;
   const total = poll.capacity + poll.waitlist;
   const full = poll.entries.length >= total;
-  const url = `${BASE_URL}/p/${poll.id}`;
+  const series = poll.seriesId ? db.series[poll.seriesId] : null;
+  const isCurrent = series && series.currentPollId === poll.id;
+  const self = isCurrent ? `/s/${series.id}` : `/p/${poll.id}`; // 반복 투표는 고정 링크
+  const url = BASE_URL + self;
+  const now = Date.now();
+  const notOpen = poll.opensAt && now < poll.opensAt;
+  const ended = poll.eventAt && now >= poll.eventAt;
+  const when = poll.eventAt ? fmtKst(poll.eventAt) : `${poll.day} ${poll.time}`;
 
   let myStatus = '';
   if (myIdx >= 0) {
@@ -177,8 +249,14 @@ function pollPage(poll, user, msg) {
   }
 
   let action;
-  if (!user) action = loginButton(`/p/${poll.id}`);
+  if (!user) action = loginButton(self);
   else if (myIdx >= 0) action = `<form method="post" action="/p/${poll.id}/leave" onsubmit="return confirm('참가를 취소할까요?')"><button class="ghost">참가 취소</button></form>`;
+  else if (ended) action = `<button disabled class="ghost">지난 회차예요</button>`;
+  else if (notOpen) {
+    // 열리는 순간 자동 새로고침 (최대 하루 단위로 대기)
+    action = `<button disabled class="ghost">${fmtKst(poll.opensAt)}에 신청이 열려요</button>
+<script>setTimeout(()=>location.reload(),${Math.min(poll.opensAt - now + 500, 86400e3)})</script>`;
+  }
   else if (poll.closed) action = `<button disabled class="ghost">마감된 투표예요</button>`;
   else if (full) action = `<button disabled class="ghost">정원·대기 모두 마감</button>`;
   else action = `<form method="post" action="/p/${poll.id}/join"><button>${poll.entries.length < poll.capacity ? '참가하기' : '대기 신청하기'}</button></form>`;
@@ -188,27 +266,42 @@ function pollPage(poll, user, msg) {
     : '';
   const row = (e) => `<li>${esc(e.name)}${user && e.uid === user.uid ? ' <b>(나)</b>' : ''}${kick(e)}</li>`;
 
-  const ownerPanel = isOwner ? `<div class="card"><details><summary>관리 (만든 사람만 보여요)</summary>
+  const seriesPanel = isOwner && series ? `<div class="card"><details><summary>매주 반복 설정</summary>
+<p class="muted">다음 회차부터 적용돼요. 지금 회차에 신청자가 없으면 바로 다시 만들어요.</p>
+<form method="post" action="/s/${series.id}/edit">
+<label>제목</label><input name="title" maxlength="60" required value="${esc(series.title)}">
+<div class="row"><div><label>모임 요일</label><select name="day">${dayOptions(series.day)}</select></div>
+<div><label>모임 시간</label><input type="time" name="time" required value="${esc(series.time)}"></div></div>
+${openFields(series.openDay, series.openTime)}
+<div class="row"><div><label>인원</label><input type="number" name="capacity" min="1" max="100" value="${series.capacity}"></div>
+<div><label>대기 인원</label><input type="number" name="waitlist" min="0" max="50" value="${series.waitlist}"></div></div>
+<label>메모</label><input name="note" maxlength="120" value="${esc(series.note)}">
+<button>반복 설정 저장</button></form>
+<form method="post" action="/s/${series.id}/toggle"><button class="ghost">${series.active ? '매주 반복 멈추기' : '매주 반복 다시 시작'}</button></form>
+</details></div>` : '';
+
+  const ownerPanel = isOwner ? `<div class="card"><details><summary>${series ? '이번 회차만 관리' : '관리 (만든 사람만 보여요)'}</summary>
 <form method="post" action="/p/${poll.id}/edit">
 <label>제목</label><input name="title" maxlength="60" required value="${esc(poll.title)}">
-<div class="row"><div><label>요일</label><select name="day">${DAYS.map((d) => `<option${d === poll.day ? ' selected' : ''}>${d}</option>`).join('')}</select></div>
-<div><label>시간</label><input type="time" name="time" required value="${esc(poll.time)}"></div></div>
+${series ? '' : `<div class="row"><div><label>요일</label><select name="day">${dayOptions(poll.day)}</select></div>
+<div><label>시간</label><input type="time" name="time" required value="${esc(poll.time)}"></div></div>`}
 <div class="row"><div><label>인원</label><input type="number" name="capacity" min="1" max="100" value="${poll.capacity}"></div>
 <div><label>대기 인원</label><input type="number" name="waitlist" min="0" max="50" value="${poll.waitlist}"></div></div>
 <label>메모</label><input name="note" maxlength="120" value="${esc(poll.note)}">
 <button>저장</button></form>
 <form method="post" action="/p/${poll.id}/close"><button class="ghost">${poll.closed ? '다시 열기' : '마감하기'}</button></form>
-<form method="post" action="/p/${poll.id}/delete" onsubmit="return confirm('투표를 삭제할까요? 되돌릴 수 없어요.')"><button class="danger">투표 삭제</button></form>
+<form method="post" action="/p/${poll.id}/delete" onsubmit="return confirm('${series ? '이번 회차를 삭제할까요? (반복 중이면 새 회차가 다시 만들어져요)' : '투표를 삭제할까요? 되돌릴 수 없어요.'}')"><button class="danger">${series ? '이번 회차 삭제' : '투표 삭제'}</button></form>
 </details></div>` : '';
 
   const shareJs = KAKAO_JS_KEY ? `<script src="https://t1.kakaocdn.net/kakao_js_sdk/2.7.2/kakao.min.js" crossorigin="anonymous"></script>
 <script>try{Kakao.init(${JSON.stringify(KAKAO_JS_KEY)})}catch(e){}
-function kshare(){Kakao.Share.sendDefault({objectType:'text',text:${JSON.stringify(`[선착순 ${poll.capacity}명] ${poll.title}\n${poll.day} ${poll.time}`)},link:{mobileWebUrl:${JSON.stringify(url)},webUrl:${JSON.stringify(url)}},buttonTitle:'참가하기'})}</script>
+function kshare(){Kakao.Share.sendDefault({objectType:'text',text:${JSON.stringify(`[선착순 ${poll.capacity}명] ${poll.title}\n${series ? `매주 ${series.day} ${series.time}` : when}`)},link:{mobileWebUrl:${JSON.stringify(url)},webUrl:${JSON.stringify(url)}},buttonTitle:'참가하기'})}</script>
 <button class="kakao" onclick="kshare()">카카오톡으로 공유</button>` : '';
 
   const body = `${msg ? `<div class="msg">${esc(msg)}</div>` : ''}
 <div class="card"><h1>${esc(poll.title)}</h1>
-<div>${esc(poll.day)} ${esc(poll.time)}${poll.closed ? ' <span class="badge bad">마감</span>' : ''}</div>
+<div>${esc(when)}${series ? ' <span class="badge ok">매주 반복</span>' : ''}${poll.closed ? ' <span class="badge bad">마감</span>' : ''}</div>
+${poll.opensAt ? `<div class="muted">신청 열림: ${fmtKst(poll.opensAt)}</div>` : ''}
 ${poll.note ? `<div class="muted">${esc(poll.note)}</div>` : ''}
 <div class="muted">만든 사람: ${esc(poll.ownerName)}</div>
 <div class="stats"><div class="stat"><b class="ok">${confirmed.length}/${poll.capacity}</b><span class="muted">확정</span></div>
@@ -217,11 +310,11 @@ ${myStatus}${action}</div>
 <div class="card"><h2>확정 명단</h2>${confirmed.length ? `<ol>${confirmed.map(row).join('')}</ol>` : '<p class="muted">아직 아무도 없어요. 첫 번째로 참가해 보세요!</p>'}</div>
 ${poll.waitlist > 0 ? `<div class="card"><h2>대기 명단</h2>${waiting.length ? `<ol>${waiting.map(row).join('')}</ol>` : '<p class="muted">대기자 없음</p>'}</div>` : ''}
 <div class="card"><button class="ghost" onclick="navigator.clipboard.writeText(${esc(JSON.stringify(url))}).then(()=>alert('링크를 복사했어요. 카톡방에 붙여넣으세요.'))">링크 복사</button>${shareJs}
-<a class="btn ghost" href="/p/${poll.id}">새로고침</a></div>
-${ownerPanel}`;
+<a class="btn ghost" href="${self}">새로고침</a></div>
+${seriesPanel}${ownerPanel}`;
   return layout(poll.title, body, {
     user,
-    og: { title: `[선착순 ${poll.capacity}명] ${poll.title}`, description: `${poll.day} ${poll.time} · 현재 ${confirmed.length}/${poll.capacity}명, 대기 ${waiting.length}/${poll.waitlist}`, url },
+    og: { title: `[선착순 ${poll.capacity}명] ${poll.title}`, description: `${when} · 현재 ${confirmed.length}/${poll.capacity}명, 대기 ${waiting.length}/${poll.waitlist}`, url },
   });
 }
 
@@ -244,6 +337,15 @@ function pollFields(b) {
     note: String(b.note || '').trim().slice(0, 120),
   };
 }
+function seriesFields(b) {
+  return {
+    ...pollFields(b),
+    openDay: DAYS.includes(b.openDay) ? b.openDay : DAYS[0],
+    openTime: /^\d{2}:\d{2}$/.test(b.openTime) ? b.openTime : '12:00',
+  };
+}
+const notFound = (res) => send(res, 404, layout('없는 투표', '<div class="card"><h1>투표를 찾을 수 없어요</h1><p class="muted">삭제되었거나 잘못된 링크예요.</p><a class="btn" href="/">처음으로</a></div>'));
+const forbidden = (res) => send(res, 403, layout('권한 없음', '<div class="card">만든 사람만 할 수 있어요.</div>'));
 
 async function handle(req, res) {
   const u = new URL(req.url, BASE_URL);
@@ -311,28 +413,70 @@ async function handle(req, res) {
   if (method === 'POST' && p === '/polls') {
     if (!user) return redirect(res, '/login?next=/');
     const b = await readBody(req);
+    if (b.repeat) {
+      const s = { id: newId(), ...seriesFields(b), ownerId: user.uid, ownerName: user.name, createdAt: Date.now(), active: true, currentPollId: null };
+      db.series[s.id] = s;
+      ensureRound(s);
+      return redirect(res, `/s/${s.id}`);
+    }
     const poll = { id: newId(), ...pollFields(b), ownerId: user.uid, ownerName: user.name, createdAt: Date.now(), closed: false, entries: [] };
     db.polls[poll.id] = poll;
     save();
     return redirect(res, `/p/${poll.id}`);
   }
 
+  // --- 매주 반복 투표 (고정 링크 → 현재 회차) ---
+  const sm = p.match(/^\/s\/([\w-]+)(?:\/(edit|toggle))?$/);
+  if (sm) {
+    const s = db.series[sm[1]];
+    if (!s) return notFound(res);
+    const action = sm[2];
+    if (method === 'GET' && !action) {
+      const poll = ensureRound(s);
+      if (!poll) return send(res, 200, layout(s.title, `<div class="card"><h1>${esc(s.title)}</h1><p class="muted">매주 반복이 멈춰 있어요.</p>
+${user && user.uid === s.ownerId ? `<form method="post" action="/s/${s.id}/toggle"><button>매주 반복 다시 시작</button></form>` : ''}</div>`, { user }));
+      return send(res, 200, pollPage(poll, user, msg));
+    }
+    if (method !== 'POST' || !action) return send(res, 405, 'Method Not Allowed');
+    if (!user) return redirect(res, `/login?next=/s/${s.id}`);
+    if (user.uid !== s.ownerId) return forbidden(res);
+    const b = await readBody(req);
+    if (action === 'edit') {
+      Object.assign(s, seriesFields(b));
+      const cur = db.polls[s.currentPollId];
+      if (cur && cur.entries.length === 0) { delete db.polls[cur.id]; s.currentPollId = null; } // 신청자 없으면 바로 새 설정으로
+      save();
+      ensureRound(s);
+      return redirect(res, `/s/${s.id}?m=seriessaved`);
+    }
+    if (action === 'toggle') {
+      s.active = !s.active;
+      save();
+      ensureRound(s);
+      return redirect(res, `/s/${s.id}?m=${s.active ? 'resumed' : 'stopped'}`);
+    }
+  }
+
   // --- 투표 페이지 / 동작 ---
   const m = p.match(/^\/p\/([\w-]+)(?:\/(join|leave|edit|close|delete|kick))?$/);
   if (m) {
     const poll = db.polls[m[1]];
-    if (!poll) return send(res, 404, layout('없는 투표', '<div class="card"><h1>투표를 찾을 수 없어요</h1><p class="muted">삭제되었거나 잘못된 링크예요.</p><a class="btn" href="/">처음으로</a></div>'));
+    if (!poll) return notFound(res);
     const action = m[2];
-    const back = (code) => redirect(res, `/p/${poll.id}${code ? '?m=' + code : ''}`);
+    const series = poll.seriesId ? db.series[poll.seriesId] : null;
+    const self = series && series.currentPollId === poll.id ? `/s/${series.id}` : `/p/${poll.id}`;
+    const back = (code) => redirect(res, `${self}${code ? '?m=' + code : ''}`);
 
     if (method === 'GET' && !action) return send(res, 200, pollPage(poll, user, msg));
     if (method !== 'POST' || !action) return send(res, 405, 'Method Not Allowed');
-    if (!user) return redirect(res, `/login?next=/p/${poll.id}`);
+    if (!user) return redirect(res, `/login?next=${self}`);
     const b = await readBody(req);
 
     // Node는 단일 스레드라 아래 검사와 추가 사이에 다른 요청이 끼어들지 않음 → 선착순 보장
     if (action === 'join') {
       if (poll.entries.some((e) => e.uid === user.uid)) return back('already');
+      if (poll.opensAt && Date.now() < poll.opensAt) return back('notopen');
+      if (poll.eventAt && Date.now() >= poll.eventAt) return back('ended');
       if (poll.closed) return back('closed');
       if (poll.entries.length >= poll.capacity + poll.waitlist) return back('full');
       poll.entries.push({ uid: user.uid, name: user.name, at: Date.now() });
@@ -345,9 +489,10 @@ async function handle(req, res) {
       return back('left');
     }
 
-    if (user.uid !== poll.ownerId) return send(res, 403, layout('권한 없음', '<div class="card">만든 사람만 할 수 있어요.</div>'));
+    if (user.uid !== poll.ownerId) return forbidden(res);
     if (action === 'edit') {
       const f = pollFields(b);
+      if (series) { delete f.day; delete f.time; } // 반복 회차의 날짜는 반복 설정에서만 바꿈
       if (f.capacity + f.waitlist < poll.entries.length) return back('toosmall');
       Object.assign(poll, f);
       save();
@@ -355,11 +500,18 @@ async function handle(req, res) {
     }
     if (action === 'close') { poll.closed = !poll.closed; save(); return back(); }
     if (action === 'kick') { poll.entries = poll.entries.filter((e) => e.uid !== b.uid); save(); return back('kicked'); }
-    if (action === 'delete') { delete db.polls[poll.id]; save(); return redirect(res, '/'); }
+    if (action === 'delete') {
+      delete db.polls[poll.id];
+      save();
+      return redirect(res, series ? `/s/${series.id}` : '/');
+    }
   }
 
   send(res, 404, layout('404', '<div class="card">페이지를 찾을 수 없어요. <a href="/">처음으로</a></div>'));
 }
+
+// 서버가 깨어 있는 동안 1분마다 다음 회차 생성 (잠들어 있어도 링크를 열면 그때 생성됨)
+setInterval(() => Object.values(db.series).forEach(ensureRound), 60e3);
 
 http.createServer((req, res) => {
   handle(req, res).catch((e) => { console.error(e); if (!res.headersSent) send(res, 500, '서버 오류'); });
